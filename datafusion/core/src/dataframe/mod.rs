@@ -2152,6 +2152,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
     async fn sendable() {
         let df = test_table().await.unwrap();
         // dataframes should be sendable between threads/tasks
