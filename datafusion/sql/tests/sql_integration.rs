@@ -4436,3 +4436,156 @@ fn init() {
     // Enable RUST_LOG logging configuration for tests
     let _ = env_logger::try_init();
 }
+
+#[test]
+fn test_no_functions_registered() {
+    let sql = "SELECT foo()";
+
+    let options = ParserOptions::default();
+    let dialect = &GenericDialect {};
+    let state = MockSessionState::default();
+    let context = MockContextProvider { state };
+    let planner = SqlToRel::new_with_options(&context, options);
+    let result = DFParser::parse_sql_with_dialect(sql, dialect);
+    let mut ast = result.unwrap();
+
+    let err = planner.statement_to_plan(ast.pop_front().unwrap());
+
+    assert_contains!(
+        err.unwrap_err().to_string(),
+        "Internal error: No functions registered with this context."
+    );
+}
+
+#[test]
+fn test_custom_type_plan() -> Result<()> {
+    let sql = "SELECT DATETIME '2001-01-01 18:00:00'";
+
+    // test the default behavior
+    let options = ParserOptions::default();
+    let dialect = &GenericDialect {};
+    let state = MockSessionState::default();
+    let context = MockContextProvider { state };
+    let planner = SqlToRel::new_with_options(&context, options);
+    let result = DFParser::parse_sql_with_dialect(sql, dialect);
+    let mut ast = result.unwrap();
+    let err = planner.statement_to_plan(ast.pop_front().unwrap());
+    assert_contains!(
+        err.unwrap_err().to_string(),
+        "This feature is not implemented: Unsupported SQL type Datetime(None)"
+    );
+
+    fn plan_sql(sql: &str) -> LogicalPlan {
+        let options = ParserOptions::default();
+        let dialect = &GenericDialect {};
+        let state = MockSessionState::default()
+            .with_scalar_function(make_array_udf())
+            .with_expr_planner(Arc::new(CustomExprPlanner {}))
+            .with_type_planner(Arc::new(CustomTypePlanner {}));
+        let context = MockContextProvider { state };
+        let planner = SqlToRel::new_with_options(&context, options);
+        let result = DFParser::parse_sql_with_dialect(sql, dialect);
+        let mut ast = result.unwrap();
+        planner.statement_to_plan(ast.pop_front().unwrap()).unwrap()
+    }
+
+    let plan = plan_sql(sql);
+    let expected =
+        "Projection: CAST(Utf8(\"2001-01-01 18:00:00\") AS Timestamp(Nanosecond, None))\
+    \n  EmptyRelation";
+    assert_eq!(plan.to_string(), expected);
+
+    let plan = plan_sql("SELECT CAST(TIMESTAMP '2001-01-01 18:00:00' AS DATETIME)");
+    let expected = "Projection: CAST(CAST(Utf8(\"2001-01-01 18:00:00\") AS Timestamp(Nanosecond, None)) AS Timestamp(Nanosecond, None))\
+    \n  EmptyRelation";
+    assert_eq!(plan.to_string(), expected);
+
+    let plan = plan_sql(
+        "SELECT ARRAY[DATETIME '2001-01-01 18:00:00', DATETIME '2001-01-02 18:00:00']",
+    );
+    let expected = "Projection: make_array(CAST(Utf8(\"2001-01-01 18:00:00\") AS Timestamp(Nanosecond, None)), CAST(Utf8(\"2001-01-02 18:00:00\") AS Timestamp(Nanosecond, None)))\
+    \n  EmptyRelation";
+    assert_eq!(plan.to_string(), expected);
+
+    Ok(())
+}
+
+fn error_message_test(sql: &str, err_msg_starts_with: &str) {
+    let err = logical_plan(sql).expect_err("query should have failed");
+    assert!(
+        err.strip_backtrace().starts_with(err_msg_starts_with),
+        "Expected error to start with '{}', but got: '{}'",
+        err_msg_starts_with,
+        err.strip_backtrace(),
+    );
+}
+
+#[test]
+fn test_error_message_invalid_scalar_function_signature() {
+    error_message_test(
+        "select sqrt()",
+        "Error during planning: sqrt does not support zero arguments",
+    );
+    error_message_test(
+        "select sqrt(1, 2)",
+        "Error during planning: Failed to coerce arguments",
+    );
+}
+
+#[test]
+fn test_error_message_invalid_aggregate_function_signature() {
+    error_message_test(
+        "select sum()",
+        "Error during planning: sum does not support zero arguments",
+    );
+    // We keep two different prefixes because they clarify each other.
+    // It might be incorrect, and we should consider keeping only one.
+    error_message_test(
+        "select max(9, 3)",
+        "Error during planning: Execution error: User-defined coercion failed",
+    );
+}
+
+#[test]
+fn test_error_message_invalid_window_function_signature() {
+    error_message_test(
+        "select rank(1) over()",
+        "Error during planning: The function expected zero argument but received 1",
+    );
+}
+
+#[test]
+fn test_error_message_invalid_window_aggregate_function_signature() {
+    error_message_test(
+        "select sum() over()",
+        "Error during planning: sum does not support zero arguments",
+    );
+}
+
+// Test issue: https://github.com/apache/datafusion/issues/14058
+// Select with wildcard over a USING/NATURAL JOIN should deduplicate condition columns.
+#[test]
+fn test_using_join_wildcard_schema() {
+    let sql = "SELECT * FROM orders o1 JOIN orders o2 USING (order_id)";
+    let plan = logical_plan(sql).unwrap();
+    let count = plan
+        .schema()
+        .iter()
+        .filter(|(_, f)| f.name() == "order_id")
+        .count();
+    // Only one order_id column
+    assert_eq!(count, 1);
+
+    let sql = "SELECT * FROM orders o1 NATURAL JOIN orders o2";
+    let plan = logical_plan(sql).unwrap();
+    // Only columns from one join side should be present
+    let expected_fields = vec![
+        "o1.order_id".to_string(),
+        "o1.customer_id".to_string(),
+        "o1.o_item_id".to_string(),
+        "o1.qty".to_string(),
+        "o1.price".to_string(),
+        "o1.delivered".to_string(),
+    ];
+    assert_eq!(plan.schema().field_names(), expected_fields);
+}
